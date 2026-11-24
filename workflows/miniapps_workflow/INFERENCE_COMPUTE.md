@@ -45,6 +45,11 @@ python -m workflows.miniapps_workflow.inference_compute --device cpu \
 
 PyTorch is an optional dependency: `pip install -e ".[inference-compute]"`.
 
+The runners use the `MiniApp(flow, telemetry)` interface of workflow-mini-apps as
+merged into its `main` branch (wfMiniAPI 0.2.0 with AsyncFlow at the commit it
+pins, `3f18cc8` or later). The script shuts the engine down, stops telemetry and
+then calls `app.verify()`; a run whose telemetry record is incomplete fails.
+
 ## Configuration
 
 ```yaml

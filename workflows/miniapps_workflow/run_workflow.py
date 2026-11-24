@@ -46,42 +46,47 @@ async def run_miniapps(config_file: str) -> None:
 
     home_dir = Path(cfg.get("home_dir", Path.home() / "MiniApps")).expanduser()
 
-    async with MiniApp(asyncflow, telemetry), asyncflow.workflow_scope("ddsim"):
-        # --- Launch replicas ---
-        replicas = [
-            workflow_class(
-                config=cfg,
-                name=f"min{i + 1}",
-                asyncflow=asyncflow,
-                telemetry=telemetry,
-                home_dir=str(home_dir),
-            )
-            for i in range(num_replicas)
-        ]
-
-        try:
-            await asyncio.gather(*[r.start() for r in replicas])
-        except Exception as e:
-            print(f"An error occurred during workflow execution: {e}")
-        finally:
-            await asyncio.gather(*[r.close() for r in replicas])
+    app = MiniApp(asyncflow, telemetry)
+    try:
+        async with app, asyncflow.workflow_scope("ddsim"):
+            # --- Launch replicas ---
+            replicas = [
+                workflow_class(
+                    config=cfg,
+                    name=f"min{i + 1}",
+                    asyncflow=asyncflow,
+                    telemetry=telemetry,
+                    home_dir=str(home_dir),
+                )
+                for i in range(num_replicas)
+            ]
 
             try:
-                summary = telemetry.summary()
-                print(f"Tasks — {summary['tasks']}")
-                if summary.get("duration"):
-                    d = summary["duration"]
-                    print(
-                        f"Mean task time: {d['mean_seconds']:.2f} s  "
-                        f"Max: {d['max_seconds']:.2f} s"
-                    )
+                await asyncio.gather(*[r.start() for r in replicas])
             except Exception as e:
-                print(f"An error occurred during telemetry summary: {e}")
+                print(f"An error occurred during workflow execution: {e}")
+            finally:
+                await asyncio.gather(*[r.close() for r in replicas])
 
-            # telemetry.stop() is done by MiniApp, after the engine has shut down
+                try:
+                    summary = telemetry.summary()
+                    print(f"Tasks — {summary['tasks']}")
+                    if summary.get("duration"):
+                        d = summary["duration"]
+                        print(
+                            f"Mean task time: {d['mean_seconds']:.2f} s  "
+                            f"Max: {d['max_seconds']:.2f} s"
+                        )
+                except Exception as e:
+                    print(f"An error occurred during telemetry summary: {e}")
+    finally:
+        try:
             await asyncflow.shutdown()
+        finally:
+            await telemetry.stop()
+            app.verify()
 
-    # after MiniApp: the sweep would otherwise cancel RHAPSODY's dispatch tasks
+    # after telemetry.stop(): the sweep would otherwise cancel RHAPSODY's dispatch tasks
     pending = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
     if pending:
         for t in pending:

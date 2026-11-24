@@ -41,6 +41,21 @@ def _write_summary(path: str, summary: dict) -> None:
         handle.write("\n")
 
 
+def _print_task_summary(telemetry) -> None:
+    """Print task counts and durations; a failure here must not end the run."""
+    try:
+        summary = telemetry.summary()
+        print(f"Tasks — {summary['tasks']}")
+        if summary.get("duration"):
+            d = summary["duration"]
+            print(
+                f"Mean task time: {d['mean_seconds']:.2f} s  "
+                f"Max: {d['max_seconds']:.2f} s"
+            )
+    except Exception as e:
+        print(f"An error occurred during telemetry summary: {e}")
+
+
 async def run_miniapps(config_file: str) -> None:
     cfg = load_config(config_file)
     workflow_class = (
@@ -121,45 +136,39 @@ async def run_miniapps(config_file: str) -> None:
 
     home_dir = Path(cfg.get("home_dir", Path.home() / "MiniApps")).expanduser()
 
+    # MiniApp records the run and verifies its telemetry; this script owns the
+    # engine and the telemetry, so it shuts them down, in this order: the engine
+    # first (the last task events are emitted), then telemetry (everything is
+    # written), then verify() (reads the finished file).
     app = MiniApp(asyncflow, telemetry, backends=[execution_backend, llm_backend])
-    async with app, asyncflow.workflow_scope("ddsim-agentic"):
-        # --- Launch replicas ---
-        replicas = [
-            workflow_class(
-                config=cfg,
-                name=f"min{i + 1}",
-                asyncflow=asyncflow,
-                telemetry=telemetry,
-                home_dir=str(home_dir),
-                llm_backend="llm",
-                backend_label=backend,
-            )
-            for i in range(num_replicas)
-        ]
-
-        try:
-            await asyncio.gather(*[r.start() for r in replicas])
-        except Exception as e:
-            print(f"An error occurred during workflow execution: {e}")
-            raise
-        finally:
-            await asyncio.gather(*[r.close() for r in replicas])
-
+    replicas = []
+    try:
+        async with app, asyncflow.workflow_scope("ddsim-agentic"):
+            replicas = [
+                workflow_class(
+                    config=cfg,
+                    name=f"min{i + 1}",
+                    asyncflow=asyncflow,
+                    telemetry=telemetry,
+                    home_dir=str(home_dir),
+                    llm_backend="llm",
+                    backend_label=backend,
+                )
+                for i in range(num_replicas)
+            ]
             try:
-                summary = telemetry.summary()
-                print(f"Tasks — {summary['tasks']}")
-                if summary.get("duration"):
-                    d = summary["duration"]
-                    print(
-                        f"Mean task time: {d['mean_seconds']:.2f} s  "
-                        f"Max: {d['max_seconds']:.2f} s"
-                    )
+                await asyncio.gather(*[r.start() for r in replicas])
             except Exception as e:
-                print(f"An error occurred during telemetry summary: {e}")
-
-            # telemetry.stop() is done by MiniApp, after the engine has shut down.
+                print(f"An error occurred during workflow execution: {e}")
+                raise
+            finally:
+                await asyncio.gather(*[r.close() for r in replicas])
+                _print_task_summary(telemetry)
+    finally:
+        try:
             # Shutting the engine down also stops the inference service (EC2 end).
             await asyncflow.shutdown()
+        finally:
             t_stopped = time.time()
             emit(
                 telemetry,
@@ -171,14 +180,19 @@ async def run_miniapps(config_file: str) -> None:
                 lifetime_ms=(t_stopped - llm_info["t_ready"]) * 1000,
                 **service,
             )
+            await telemetry.stop()
+            report = app.verify()
 
-    if app.report is None or not app.report.telemetry_complete:
-        raise RuntimeError("mini-app telemetry verification failed")
+    # Reached only when the workflow itself succeeded, so this never hides its error.
+    if not report.telemetry_complete:
+        raise RuntimeError(
+            "mini-app telemetry is incomplete: " + "; ".join(report.reasons)
+        )
     summary_path = cfg.get("run_summary_path")
     if summary_path:
         summary = {
             "session_id": asyncflow.uid,
-            "telemetry_report": app.report.to_dict(),
+            "telemetry_report": report.to_dict(),
             "service": llm_info,
             "replicas": [
                 {
@@ -194,7 +208,7 @@ async def run_miniapps(config_file: str) -> None:
         }
         await asyncio.to_thread(_write_summary, summary_path, summary)
 
-    # after MiniApp: the sweep would otherwise cancel RHAPSODY's dispatch tasks
+    # after telemetry.stop(): the sweep would otherwise cancel RHAPSODY's dispatch tasks
     pending = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
     if pending:
         for t in pending:
